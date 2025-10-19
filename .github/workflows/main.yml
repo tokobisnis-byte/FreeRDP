@@ -3,16 +3,15 @@ name: RDP Enhanced
 on:
   workflow_dispatch:
   schedule:
-    # Improved schedule - lebih sering untuk menghindari gap
-    - cron: '0 */4 * * *'  # Setiap 4 jam (lebih aman dari timeout 6 jam)
-    - cron: '30 */4 * * *' # Backup schedule 30 menit setelah primary
+    - cron: '0 */4 * * *'   # primary every 4 hours
+    - cron: '30 */4 * * *'  # backup 30 minutes later
 
 concurrency:
   group: rdp-enhanced
   cancel-in-progress: false
 
 env:
-  MAX_RUNTIME: 330  # 5.5 jam (330 menit) - lebih aman
+  MAX_RUNTIME: 330
   RDP_USERNAME: "RDPUser"
 
 jobs:
@@ -28,28 +27,18 @@ jobs:
           Get-WmiObject -Class Win32_LogicalDisk | Format-Table DeviceID, Size, FreeSpace
 
       - name: Configure Enhanced RDP Settings
+        shell: powershell
         run: |
-          # Enable RDP dengan security optimal
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "fDenyTSConnections" -Value 0 -Force
-          
-          # Security configurations
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "UserAuthentication" -Value 1 -Force  # NLA enabled untuk security
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "SecurityLayer" -Value 1 -Force
-          
-          # Performance optimizations
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
-                           -Name "MaxInstanceCount" -Value 2 -Force
-          
-          # Firewall configuration dengan nama unik
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name "MaxInstanceCount" -Value 2 -Force
+
           $ruleName = "RDP-Tailscale-$env:GITHUB_RUN_ID"
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>&1 | Out-Null
           netsh advfirewall firewall delete rule name=$ruleName 2>&1 | Out-Null
           netsh advfirewall firewall add rule name=$ruleName dir=in action=allow protocol=TCP localport=3389 description="RDP via Tailscale for GitHub Runner"
-          
-          # Restart service dengan error handling
+
           try {
               Restart-Service -Name TermService -Force -ErrorAction Stop
               Write-Host "✅ RDP Service restarted successfully"
@@ -60,83 +49,44 @@ jobs:
 
       - name: Create Secure RDP User
         id: create-user
+        shell: powershell
         run: |
-          # Hapus user lama jika ada (cleanup)
           $existingUser = Get-LocalUser -Name "$env:RDP_USERNAME" -ErrorAction SilentlyContinue
-          if ($existingUser) {
-              Remove-LocalUser -Name "$env:RDP_USERNAME"
-              Write-Host "🗑️ Removed existing user"
-          }
+          if ($existingUser) { Remove-LocalUser -Name "$env:RDP_USERNAME" }
 
-          # Generate strong password dengan cryptographic RNG
           Add-Type -AssemblyName System.Web
-          $minLength = 16
-          $maxLength = 20
+          $minLength = 16; $maxLength = 20
           $length = Get-Random -Minimum $minLength -Maximum ($maxLength + 1)
-          
-          # Password requirements: uppercase, lowercase, numbers, special chars
-          $password = [System.Web.Security.Membership]::GeneratePassword($length, 4)
-          
-          # Ensure password meets complexity requirements
-          do {
-              $password = [System.Web.Security.Membership]::GeneratePassword($length, 4)
-          } while (
-              $password -notmatch '[A-Z]' -or 
-              $password -notmatch '[a-z]' -or 
-              $password -notmatch '[0-9]' -or 
-              $password -notmatch '[^a-zA-Z0-9]'
-          )
-          
+          do { $password = [System.Web.Security.Membership]::GeneratePassword($length, 4) } while ($password -notmatch '[A-Z]' -or $password -notmatch '[a-z]' -or $password -notmatch '[0-9]' -or $password -notmatch '[^a-zA-Z0-9]')
+
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          
-          # Create user dengan security settings
           New-LocalUser -Name "$env:RDP_USERNAME" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "$env:RDP_USERNAME"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "$env:RDP_USERNAME"
-          
-          # Set user permissions
           Set-LocalUser -Name "$env:RDP_USERNAME" -UserMayChangePassword $false
-          
-          # Simpan credentials
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           echo "::add-mask::$password"
           Write-Host "✅ User created: $env:RDP_USERNAME"
 
       - name: Install Tailscale with Retry
+        shell: powershell
         run: |
-          $retryCount = 0
-          $maxRetries = 3
-          $success = $false
-          
+          $retryCount = 0; $maxRetries = 3; $success = $false
           while (-not $success -and $retryCount -lt $maxRetries) {
               try {
                   $retryCount++
                   Write-Host "📦 Installing Tailscale (Attempt $retryCount)..."
-                  
                   $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
                   $installerPath = "$env:TEMP\tailscale-$retryCount.msi"
-                  
-                  # Download dengan timeout
                   Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -TimeoutSec 30
-                  
-                  # Install dengan logging
                   $process = Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart", "/l*v", "$env:TEMP\tailscale-install.log" -PassThru -Wait
-                  
-                  if ($process.ExitCode -eq 0) {
-                      $success = $true
-                      Write-Host "✅ Tailscale installed successfully"
-                  } else {
-                      Write-Warning "Tailscale installation failed with exit code: $($process.ExitCode)"
-                      if (Test-Path "$env:TEMP\tailscale-install.log") {
-                          Get-Content "$env:TEMP\tailscale-install.log" | Select-Object -Last 20
-                      }
+                  if ($process.ExitCode -eq 0) { $success = $true; Write-Host "✅ Tailscale installed successfully" } else {
+                      Write-Warning "Install failed exitcode: $($process.ExitCode)"
+                      if (Test-Path "$env:TEMP\tailscale-install.log") { Get-Content "$env:TEMP\tailscale-install.log" | Select-Object -Last 20 }
                   }
-                  
               } catch {
                   Write-Warning "Attempt $retryCount failed: $_"
-                  if ($retryCount -eq $maxRetries) {
-                      throw
-                  }
+                  if ($retryCount -eq $maxRetries) { throw }
                   Start-Sleep -Seconds 10
               } finally {
                   if (Test-Path $installerPath) { Remove-Item $installerPath -Force }
@@ -147,92 +97,51 @@ jobs:
         id: tailscale
         env:
           TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        shell: powershell
         run: |
           $hostname = "gh-rdp-$env:GITHUB_RUN_ID-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
           Write-Host "🔗 Connecting to Tailscale as: $hostname"
-          
-          # Up Tailscale dengan options
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TS_AUTH_KEY --hostname=$hostname --accept-routes --accept-dns --reset
-          
-          # Wait for IP assignment dengan exponential backoff
-          $tsIP = $null
-          $attempt = 0
-          $maxAttempts = 10
-          
+
+          $tsIP = $null; $attempt = 0; $maxAttempts = 10
           while (-not $tsIP -and $attempt -lt $maxAttempts) {
-              $attempt++
-              Start-Sleep -Seconds (5 * $attempt)  # Exponential backoff: 5, 10, 15... detik
-              
+              $attempt++; Start-Sleep -Seconds (5 * $attempt)
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              if ($tsIP) {
-                  Write-Host "✅ Tailscale IP: $tsIP"
-                  break
-              } else {
-                  Write-Host "⏳ Waiting for Tailscale IP... (Attempt $attempt/$maxAttempts)"
-                  # Coba reset connection setiap 3 attempt
-                  if ($attempt % 3 -eq 0) {
-                      & "$env:ProgramFiles\Tailscale\tailscale.exe" up --reset
-                  }
-              }
+              if ($tsIP) { Write-Host "✅ Tailscale IP: $tsIP"; break }
+              Write-Host "⏳ Waiting for Tailscale IP... (Attempt $attempt/$maxAttempts)"
+              if ($attempt % 3 -eq 0) { & "$env:ProgramFiles\Tailscale\tailscale.exe" up --reset }
           }
-          
+
           if (-not $tsIP) {
-              # Fallback: coba dapatkan IP dengan method lain
-              Write-Warning "Trying alternative method to get Tailscale IP..."
+              Write-Warning "Trying alternative status JSON..."
               $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
               $tsIP = $tsStatus.Self.TailscaleIPs[0]
           }
-          
-          if (-not $tsIP) {
-              Write-Error "❌ Failed to get Tailscale IP after $maxAttempts attempts"
-              exit 1
-          }
-          
+          if (-not $tsIP) { Write-Error "❌ Failed to get Tailscale IP after $maxAttempts attempts"; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           echo "::add-mask::$tsIP"
 
       - name: Comprehensive RDP Health Check
+        shell: powershell
         run: |
           Write-Host "🏥 Starting RDP Health Check..."
-          
-          # Check RDP service status
           $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
-          if ($rdpService.Status -ne 'Running') {
-              Write-Warning "RDP Service not running. Attempting to start..."
-              Start-Service -Name TermService
-              Start-Sleep -Seconds 5
-          }
-          
-          # Test port connectivity
-          Write-Host "🔍 Testing RDP port connectivity..."
+          if ($rdpService.Status -ne 'Running') { Start-Service -Name TermService; Start-Sleep -Seconds 5 }
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
-          
           if (-not $testResult) {
               Write-Warning "Port test failed, checking firewall..."
-              # Check firewall rule
-              $firewallRule = netsh advfirewall firewall show rule name="RDP-Tailscale-$env:GITHUB_RUN_ID"
-              if ($LASTEXITCODE -ne 0) {
-                  Write-Warning "Firewall rule missing, recreating..."
-                  netsh advfirewall firewall add rule name="RDP-Tailscale-$env:GITHUB_RUN_ID" dir=in action=allow protocol=TCP localport=3389
-              }
-              
-              # Retry test
+              netsh advfirewall firewall add rule name="RDP-Tailscale-$env:GITHUB_RUN_ID" dir=in action=allow protocol=TCP localport=3389
               Start-Sleep -Seconds 5
               $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
           }
-          
-          if ($testResult) {
-              Write-Host "✅ RDP Health Check PASSED"
-          } else {
-              Write-Error "❌ RDP Health Check FAILED"
-              exit 1
-          }
+          if ($testResult) { Write-Host "✅ RDP Health Check PASSED" } else { Write-Error "❌ RDP Health Check FAILED"; exit 1 }
 
       - name: Notify Telegram (Enhanced)
         id: notify-start
+        shell: powershell
         env:
-          BOT_TOKEN: ${{ secrets.8214123519:AAEEjhxcUUFivoeJI9J-IfNlw8cLeeKmU-4 }}
-          CHAT_ID: ${{ secrets.87394692 }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           $ip = $env:TAILSCALE_IP
           $user = $env:RDP_USERNAME
@@ -242,22 +151,21 @@ jobs:
           $commit = $env:GITHUB_SHA.Substring(0, 7)
           $workflow = $env:GITHUB_WORKFLOW
           $expiryTime = (Get-Date).AddMinutes($env:MAX_RUNTIME).ToString("yyyy-MM-dd HH:mm:ss UTC")
-          
-          # System info untuk monitoring
+
           $memory = (Get-WmiObject -Class Win32_ComputerSystem).TotalPhysicalMemory / 1GB
           $disk = (Get-WmiObject -Class Win32_LogicalDisk -Filter "DeviceID='C:'").FreeSpace / 1GB
-          
+
           $msg = @"
-🚀 *RDP Session Started* 
+🚀 *RDP Session Started*
 ───────────────────────
-*Repository:* \`$repo\`
-*Run ID:* \`$run\` | *Commit:* \`$commit\`
-*Workflow:* \`$workflow\`
+*Repository:* `$repo`
+*Run ID:* `$run` | *Commit:* `$commit`
+*Workflow:* `$workflow`
 
 *📍 Connection Details:*
-• *Address:* \`$ip\`
-• *Username:* \`$user\`
-• *Password:* \`$pass\`
+• *Address:* `$ip`
+• *Username:* `$user`
+• *Password:* `$pass`
 
 *📊 System Resources:*
 • Memory: $([math]::Round($memory, 1)) GB
@@ -271,7 +179,6 @@ jobs:
 *🔒 Security Notes:*
 • Tailscale VPN secured
 • NLA Authentication enabled
-• Auto-destroy after session
 "@
 
           $uri = "https://api.telegram.org/bot$($env:BOT_TOKEN)/sendMessage"
@@ -281,149 +188,83 @@ jobs:
             parse_mode = "Markdown"
             disable_web_page_preview = $true
           }
-          
-          try {
-              $response = Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json"
-              Write-Host "✅ Notification sent successfully"
-          } catch {
-              Write-Warning "⚠️ Failed to send Telegram notification: $_"
-          }
+          try { Invoke-RestMethod -Uri $uri -Method Post -Body ($body | ConvertTo-Json -Depth 4) -ContentType "application/json" | Out-Null; Write-Host "✅ Notification sent" } catch { Write-Warning "Telegram notify failed: $_" }
 
       - name: Active Session Maintenance
         id: maintenance
+        shell: powershell
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          function Send-StatusUpdate {
-              param($Message)
-              
+          function Send-StatusUpdate { param($Message) 
               $uri = "https://api.telegram.org/bot$($env:BOT_TOKEN)/sendMessage"
-              $body = @{
-                chat_id = $env:CHAT_ID
-                text = $Message
-                parse_mode = "Markdown"
-                disable_web_page_preview = $true
-              }
-              try {
-                  Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json" | Out-Null
-              } catch {
-                  Write-Warning "Status update failed: $_"
-              }
+              $body = @{ chat_id = $env:CHAT_ID; text = $Message; parse_mode = "Markdown"; disable_web_page_preview = $true }
+              try { Invoke-RestMethod -Uri $uri -Method Post -Body ($body | ConvertTo-Json -Depth 4) -ContentType "application/json" | Out-Null } catch { Write-Warning "Status update failed: $_" }
           }
-          
-          # Session monitoring dengan health checks
+
           $sessionStart = Get-Date
-          $checkInterval = 300  # 5 menit
+          $checkInterval = 300
           $lastCheck = $sessionStart
-          $nextRenewal = $sessionStart.AddMinutes($env:MAX_RUNTIME - 30)  # Notify 30 menit sebelum end
-          
+          $nextRenewal = $sessionStart.AddMinutes($env:MAX_RUNTIME - 30)
+
           Write-Host "🔧 Starting session maintenance loop..."
-          Write-Host "Session started at: $sessionStart"
-          Write-Host "Expected end time: $($sessionStart.AddMinutes($env:MAX_RUNTIME))"
-          
-          # Display connection info
-          Write-Host "`n" + "="*50
-          Write-Host "🔑 RDP CONNECTION DETAILS"
-          Write-Host "="*50
           Write-Host "IP Address: $env:TAILSCALE_IP"
-          Write-Host "Username: $env:RDP_USERNAME" 
+          Write-Host "Username: $env:RDP_USERNAME"
           Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "="*50 + "`n"
-          
-          # Main maintenance loop
+
           for ($minute = 0; $minute -lt $env:MAX_RUNTIME; $minute++) {
               $currentTime = Get-Date
-              
-              # Health check setiap 5 menit
               if (($currentTime - $lastCheck).TotalMinutes -ge 5) {
-                  Write-Host "[$($currentTime.ToString('HH:mm:ss'))] 🔍 Health check..."
-                  
-                  # Check RDP service
                   $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
-                  if ($rdpService.Status -ne 'Running') {
-                      Write-Warning "RDP service not running, restarting..."
-                      Start-Service -Name TermService -ErrorAction SilentlyContinue
-                  }
-                  
-                  # Check Tailscale connection
+                  if ($rdpService.Status -ne 'Running') { Start-Service -Name TermService -ErrorAction SilentlyContinue }
                   $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
-                  if (-not $tsStatus.BackendState -eq "Running") {
-                      Write-Warning "Tailscale disconnected, reconnecting..."
-                      & "$env:ProgramFiles\Tailscale\tailscale.exe" up --reset
-                  }
-                  
+                  if (-not $tsStatus.BackendState -eq "Running") { & "$env:ProgramFiles\Tailscale\tailscale.exe" up --reset }
                   $lastCheck = $currentTime
               }
-              
-              # Notify 30 menit sebelum renewal
+
               if ($currentTime -ge $nextRenewal -and $minute -eq ($env:MAX_RUNTIME - 30)) {
-                  $msg = "🔄 *RDP Renewal Notice*\n\nCurrent session ending in 30 minutes. New session will auto-start via schedule.\n\nIP: \`$env:TAILSCALE_IP\`"
+                  $msg = "🔄 *RDP Renewal Notice*\n\nCurrent session ending in 30 minutes. New session will auto-start via schedule.\n\nIP: `$env:TAILSCALE_IP`"
                   Send-StatusUpdate -Message $msg
-                  Write-Host "⏰ Renewal notification sent"
               }
-              
-              # Progress update setiap 30 menit
+
               if ($minute % 30 -eq 0) {
                   $elapsed = [math]::Round(($currentTime - $sessionStart).TotalMinutes, 1)
                   $remaining = $env:MAX_RUNTIME - $elapsed
                   Write-Host "[$($currentTime.ToString('HH:mm:ss'))] ⏱️ Session active: ${elapsed}m elapsed, ${remaining}m remaining"
               }
-              
+
               Start-Sleep -Seconds 60
           }
-          
           Write-Host "🛑 Session maintenance loop completed"
 
       - name: Cleanup and Final Notification
         if: always()
+        shell: powershell
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           $sessionDuration = "$env:MAX_RUNTIME minutes"
           $ip = $env:TAILSCALE_IP
-          
-          # Cleanup tasks
           try {
-              Write-Host "🧹 Cleaning up..."
-              
-              # Hapus firewall rule
               netsh advfirewall firewall delete rule name="RDP-Tailscale-$env:GITHUB_RUN_ID" 2>&1 | Out-Null
-              
-              # Disconnect Tailscale
               & "$env:ProgramFiles\Tailscale\tailscale.exe" down 2>&1 | Out-Null
-              
               Write-Host "✅ Cleanup completed"
-          } catch {
-              Write-Warning "Cleanup had issues: $_"
-          }
-          
-          # Final notification
+          } catch { Write-Warning "Cleanup had issues: $_" }
+
           if ($env:TAILSCALE_IP) {
               $msg = @"
 🔚 *RDP Session Ended*
 ────────────────────
-*IP Address:* \`$ip\`
+*IP Address:* `$ip`
 *Duration:* $sessionDuration
 *Status:* $env:JOB_STATUS
 
 *Next session:* Auto-starts via schedule (every 4 hours)
 *Time:* $(Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC")
 "@
-
               $uri = "https://api.telegram.org/bot$($env:BOT_TOKEN)/sendMessage"
-              $body = @{
-                chat_id = $env:CHAT_ID
-                text = $msg
-                parse_mode = "Markdown"
-                disable_web_page_preview = $true
-              }
-              
-              try {
-                  Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json"
-                  Write-Host "✅ Final notification sent"
-              } catch {
-                  Write-Warning "Final notification failed: $_"
-              }
+              $body = @{ chat_id = $env:CHAT_ID; text = $msg; parse_mode = "Markdown"; disable_web_page_preview = $true }
+              try { Invoke-RestMethod -Uri $uri -Method Post -Body ($body | ConvertTo-Json -Depth 4) -ContentType "application/json" | Out-Null; Write-Host "✅ Final notification sent" } catch { Write-Warning "Final notification failed: $_" }
           }
